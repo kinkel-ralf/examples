@@ -78,8 +78,17 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
 
-best_acc1 = 0
+parser.add_argument('--challenge', default=False,
+                    help="define if you want to use the challenger model for data augmentation and the version "
+                         "use old (high/low with fixed value) or new (high/low/middle with random value)")
+parser.add_argument('--strength', default=0, type=float,
+                    help="strength of challenger augmentation")
+parser.add_argument('--k', default=3, type=int,
+                    help="top k classes might be the target for attribution")
+parser.add_argument('--augmentation', default=1, type=int, help="determines if data augmentation is applied")
 
+
+best_acc1 = 0
 
 def main():
     args = parser.parse_args()
@@ -233,14 +242,20 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
+        if args.augmentation:
+            train_transform = transforms.Compose([
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
-            ]))
+                normalize,])
+        else:
+            train_transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,])
+
+        train_dataset = datasets.ImageFolder(traindir, train_transform)
 
         val_dataset = datasets.ImageFolder(
             valdir,
@@ -297,6 +312,44 @@ def main_worker(gpu, ngpus_per_node, args):
                 'scheduler' : scheduler.state_dict()
             }, is_best)
 
+def challenger(model, images, version, strength, k, device, cutoff_quantiles=torch.tensor([0.1, 0.9])):
+    images.requires_grad = True
+    outputs = model(images)
+
+    top = torch.topk(outputs, k)
+    target = random.randint(0, k - 1)
+    torch.sum(top[0][:, target]).backward()
+    attribution = images.grad
+    original_shape = attribution.shape
+    batch_size = outputs.shape[0]
+    attribution = attribution.reshape(batch_size, -1)
+
+    # Calculate cutoffs
+    cutoffs = torch.quantile(attribution, cutoff_quantiles.to(device), dim=1, keepdim=True)
+
+    if version == "old":
+        adj_set = torch.tensor([[0,0,0],[0,0,0],[0,0,0],[0,0,0],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]])
+    elif version == "new":
+        adj_set = torch.tensor([[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]])
+    else:
+        print("ERROR: use 'old' or 'new' as challenge argument")
+
+    # Determine relevant features
+    smallest = torch.where(attribution < cutoffs[0], torch.tensor(1.0).to(device), torch.tensor(0.0).to(device))
+    highest = torch.where(attribution > cutoffs[1], torch.tensor(1.0).to(device), torch.tensor(0.0).to(device))
+
+    # Change smallest and highest features either positively, negatively or not
+    module = torch.randint(0, len(adj_set), (batch_size,1)) * torch.ones((1,3), dtype=int)
+    mults = torch.gather(adj_set, 0, module).to(device)
+    selection = mults[:,2].reshape(batch_size,1) * smallest + mults[:,1].reshape(batch_size,1) * highest + mults[:,0].reshape(batch_size,1)
+
+    if version == "new":
+        selection *= abs(torch.randn((batch_size,1)).to(device))
+
+    augmentation = selection.reshape(original_shape)
+    augmented_images = images + augmentation * strength
+
+    return augmented_images
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -322,6 +375,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         target = target.to(device, non_blocking=True)
 
         # compute output
+        if args.challenge:
+            images = challenger(model, images, args.challenge, args.strength, args.k, device)
         output = model(images)
         loss = criterion(output, target)
 
